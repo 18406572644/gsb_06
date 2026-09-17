@@ -85,8 +85,11 @@
  */
 const $ = (id) => document.getElementById(id);
 let ws = null, me = null, currentRoom = null;
-const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], pending:Map}
+// roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], pending:Map,
+//            permByUser:Map<userId, version>, lastMembers:[]}
+const rooms = new Map();
 let reconnectDelay = 500, ackTimer = null, retryTimer = null;
+const muteExpiryTimers = new Map(); // roomId -> timer（多房间各自独立）
 
 const store = {
   key: () => 'chat:' + me.name,
@@ -137,12 +140,19 @@ function handle(m) {
     case 'welcome': break;
     case 'joined': {
       const saved = store.load();
-      const r = rooms.get(m.roomId) || { msgs: [], pending: new Map(), lastSeenSeq: 0 };
-      r.name = m.name; r.role = m.role; r.mutedUntil = m.mutedUntil;
+      const r = rooms.get(m.roomId) || {
+        msgs: [], pending: new Map(), lastSeenSeq: 0,
+        mutedUntil: 0, permVersion: 0, role: 'member', permByUser: new Map(),
+      };
+      r.name = m.name; r.role = m.role;
+      // 以服务端快照为准初始化自己的权限版本
+      r.permVersion = Math.max(r.permVersion || 0, m.permVersion || 0);
+      r.mutedUntil = m.mutedUntil || 0;
+      r.permByUser.set(me.userId, r.permVersion);
       r.lastSeenSeq = Math.max(r.lastSeenSeq, saved[m.roomId]?.lastSeenSeq || 0);
       rooms.set(m.roomId, r);
       if (!currentRoom) currentRoom = m.roomId;
-      renderRooms(); render(); refreshMembers();
+      renderRooms(); render(); refreshMembers(); scheduleMuteExpiry(m.roomId);
       break;
     }
     case 'msg': {
@@ -176,15 +186,55 @@ function handle(m) {
       break;
     case 'notice': {
       const r = rooms.get(m.roomId);
-      if (r && m.userId === me.userId) r.mutedUntil = m.event === 'muted' ? m.until : 0;
-      sys(m.roomId, m.event === 'muted' ? `有成员被禁言至 ${new Date(m.until).toLocaleTimeString()}` : '有成员被解除禁言');
+      if (!r) break;
+      // —— 版本门控：通知只携带目标成员的新版本号，按成员单调应用 ——
+      // 乱序投递、断线重放、并发管理员的旧操作通知，都无法把状态改回旧值。
+      const seen = r.permByUser.get(m.userId) || 0;
+      if (Number.isInteger(m.version) && m.version <= seen) break; // 过期通知，丢弃
+      if (Number.isInteger(m.version)) r.permByUser.set(m.userId, m.version);
+
+      if (m.userId === me.userId) {
+        // 自己的状态只认权威帧：role 事件更新角色，muted/unmuted 更新禁言截止
+        if (m.event === 'role' && m.role) r.role = m.role;
+        if (m.event === 'muted') r.mutedUntil = m.mutedUntil ?? m.until ?? 0;
+        if (m.event === 'unmuted') r.mutedUntil = 0;
+        scheduleMuteExpiry(m.roomId);
+      }
+      const text = m.event === 'muted'
+        ? `有成员被禁言至 ${new Date(m.mutedUntil ?? m.until).toLocaleTimeString()}`
+        : m.event === 'unmuted' ? '有成员被解除禁言'
+        : m.role === 'admin' ? '有成员被设为管理员' : '有成员被取消管理员';
+      sys(m.roomId, text);
       refreshMembers();
+      render();
       break;
     }
     case 'members':
-      if (m.roomId === currentRoom) renderMembers(m.members);
+      // 成员列表是权威快照：用其中的版本号校正本地视图，防止漏掉通知
+      if (m.roomId === currentRoom) {
+        const r = rooms.get(m.roomId);
+        if (r) {
+          for (const mem of m.members) {
+            const v = mem.permVersion || 0;
+            const seen = r.permByUser.get(mem.userId) || 0;
+            if (v >= seen) r.permByUser.set(mem.userId, v);
+            // 快照里自己的版本更新（漏过通知的兜底）：以快照为准
+            if (mem.userId === me.userId && v > (r.permVersion || 0)) {
+              r.permVersion = v; r.role = mem.role; r.mutedUntil = mem.mutedUntil || 0;
+              scheduleMuteExpiry(m.roomId);
+            }
+          }
+        }
+        renderMembers(m.members);
+        render();
+      }
       break;
     case 'error':
+      // 并发冲突：本地视图过期，立即拉取权威成员列表校正后可重试
+      if (m.code === 'PERM_VERSION_CONFLICT') {
+        sys(currentRoom, '权限刚被其他管理员修改，已刷新最新状态');
+        refreshMembers();
+      }
       sys(currentRoom, `错误 [${m.code}] ${m.message}`);
       break;
     case 'server_shutdown': sys(currentRoom, '服务器即将重启…'); break;
@@ -197,6 +247,30 @@ function scheduleAck() {
     ackTimer = null;
     for (const [id, r] of rooms) if (r.lastSeenSeq > 0) send({ type: 'ack', roomId: id, seq: r.lastSeenSeq });
   }, 500);
+}
+
+/**
+ * 禁言到期自动恢复输入：服务端的 mutedUntil 是绝对截止时间，客户端不等通知，
+ * 到期即本地解除禁用（服务端判定同样按时间过期，二者口径一致）。
+ * 每房间一个定时器：每次收到更新的禁言状态时重设（旧定时器由 clearTimeout 取消）。
+ */
+function scheduleMuteExpiry(roomId) {
+  const r = rooms.get(roomId);
+  if (!r) return;
+  clearTimeout(muteExpiryTimers.get(roomId));
+  muteExpiryTimers.delete(roomId);
+  const delay = (r.mutedUntil || 0) - Date.now();
+  if (delay > 0 && delay <= 24 * 3600_000) {
+    const timer = setTimeout(() => {
+      muteExpiryTimers.delete(roomId);
+      const cur = rooms.get(roomId);
+      if (cur && (cur.mutedUntil || 0) <= Date.now()) {
+        cur.mutedUntil = 0;
+        render();
+      }
+    }, delay + 50);
+    muteExpiryTimers.set(roomId, timer);
+  }
 }
 
 function refreshMembers() { if (currentRoom) send({ type: 'members', roomId: currentRoom }); }
@@ -249,27 +323,41 @@ function render() {
   $('msgInput').disabled = muted;
 }
 
-// 把 members 响应接进渲染
+// 把 members 响应接进渲染（保存最近一次权威快照，供操作时携带 version）
 function renderMembers(list) {
   const r = rooms.get(currentRoom); if (!r) return;
+  r.lastMembers = list;
   $('members').innerHTML = '<b>成员</b>' + list.map((m) => {
     const muted = m.mutedUntil > Date.now();
-    const adminBtns = r.role === 'admin' && m.userId !== me.userId && m.role !== 'admin'
-      ? (muted ? `<button data-act="unmute" data-uid="${m.userId}">解禁</button>`
-               : `<button data-act="mute" data-uid="${m.userId}">禁言</button>`) : '';
+    const isSelf = m.userId === me.userId;
+    let btns = '';
+    // 管理员可对其他普通成员禁言/解禁；可对他人升降级（不能降自己）
+    if (r.role === 'admin' && !isSelf && m.role !== 'admin') {
+      btns = muted
+        ? `<button data-act="unmute" data-uid="${m.userId}" data-ver="${m.permVersion || 0}">解禁</button>`
+        : `<button data-act="mute" data-uid="${m.userId}" data-ver="${m.permVersion || 0}">禁言</button>`;
+      btns += `<button data-act="promote" data-uid="${m.userId}" data-ver="${m.permVersion || 0}">升权</button>`;
+    } else if (r.role === 'admin' && !isSelf && m.role === 'admin') {
+      btns = `<button data-act="demote" data-uid="${m.userId}" data-ver="${m.permVersion || 0}">降权</button>`;
+    }
     return `<div class="m"><span class="dot ${m.online ? 'on' : ''}"></span>
       ${escapeHtml(m.name)}
       ${m.role === 'admin' ? '<span class="tag">管理员</span>' : ''}
       ${muted ? '<span class="tag muted">禁言中</span>' : ''}
-      ${adminBtns}</div>`;
+      ${btns}</div>`;
   }).join('');
   $('members').querySelectorAll('button').forEach((b) => {
     b.onclick = () => {
+      const v = { roomId: currentRoom, userId: b.dataset.uid, version: Number(b.dataset.ver) };
       if (b.dataset.act === 'mute') {
         const mins = prompt('禁言时长（分钟）', '10');
-        if (mins) send({ type: 'mute', roomId: currentRoom, userId: b.dataset.uid, minutes: Number(mins) });
-      } else {
-        send({ type: 'unmute', roomId: currentRoom, userId: b.dataset.uid });
+        if (mins) send({ type: 'mute', ...v, minutes: Number(mins) });
+      } else if (b.dataset.act === 'unmute') {
+        send({ type: 'unmute', ...v });
+      } else if (b.dataset.act === 'promote') {
+        send({ type: 'set_role', ...v, role: 'admin' });
+      } else if (b.dataset.act === 'demote') {
+        send({ type: 'set_role', ...v, role: 'member' });
       }
     };
   });
@@ -288,7 +376,10 @@ $('loginForm').onsubmit = async (e) => {
   // 恢复房间进度
   const saved = store.load();
   for (const [id, info] of Object.entries(saved)) {
-    rooms.set(id, { name: info.name, msgs: [], pending: new Map(), lastSeenSeq: info.lastSeenSeq || 0 });
+    rooms.set(id, {
+      name: info.name, msgs: [], pending: new Map(), lastSeenSeq: info.lastSeenSeq || 0,
+      role: 'member', mutedUntil: 0, permVersion: 0, permByUser: new Map(),
+    });
   }
   $('loginForm').classList.add('hidden');
   $('roomPanel').classList.remove('hidden');

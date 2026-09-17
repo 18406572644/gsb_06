@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { WebSocketServer } = require('ws');
 
-const { ChatDB } = require('./db');
+const { ChatDB, ChatDBError } = require('./db');
 const { Hub, Connection } = require('./hub');
 const defaultConfig = require('./config');
 const {
@@ -18,16 +18,28 @@ const {
   now,
 } = require('./util');
 
-/** 业务错误：handler 抛出，统一转成 error 帧回给客户端 */
+/** 业务错误：handler 抛出，统一转成 error 帧回给客户端。details 随错误帧原样下发。 */
 class ChatError extends Error {
-  constructor(code, message) {
+  constructor(code, message, details = null) {
     super(message);
     this.code = code;
+    this.details = details;
   }
 }
-const fail = (code, message) => {
-  throw new ChatError(code, message);
+const fail = (code, message, details = null) => {
+  throw new ChatError(code, message, details);
 };
+
+/** 权威成员状态 -> 下发/错误帧中的精简形状（字段名与协议保持一致） */
+function memberState(m) {
+  return {
+    roomId: m.roomId,
+    userId: m.userId,
+    role: m.role,
+    mutedUntil: m.mutedUntil,
+    version: m.permVersion,
+  };
+}
 
 /** 令牌桶限流（按用户），防刷屏 */
 class TokenBucket {
@@ -90,10 +102,49 @@ function createChatServer(overrides = {}) {
     return member;
   }
 
-  function requireAdmin(conn, roomId) {
-    const member = requireMember(conn, roomId);
-    if (member.role !== 'admin') fail('FORBIDDEN', 'admin role required');
-    return member;
+  /**
+   * 执行一次权限变更并把 DB 层错误翻译成协议错误。
+   * 管理员身份与全部守卫都在事务内基于最新行复核——不再依赖连接的陈旧快照。
+   * 版本冲突时把权威当前状态随 PERM_VERSION_CONFLICT 回给操作者，供其刷新后重试。
+   */
+  function applyPerm(conn, roomId, { action, targetId, mutedUntil, role, expectedVersion }) {
+    try {
+      return db.changeMemberPermission({
+        roomId,
+        actorId: conn.userId,
+        targetId,
+        action,
+        mutedUntil,
+        role,
+        expectedVersion,
+      });
+    } catch (err) {
+      if (err instanceof ChatDBError) {
+        fail(err.code, err.message, err.current ? { current: memberState(err.current) } : null);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * 用事务提交后的权威成员行构造并广播权限通知。
+   * 帧里的 role/mutedUntil/version/ts 全部取自同一权威行，rev 给出全局顺序——
+   * 客户端按 version 单调应用，乱序/重放的旧通知无法把状态回退。
+   */
+  function broadcastPermNotice(roomId, event, member, rev, actorId, extra = {}) {
+    hub.broadcast(roomId, {
+      type: 'notice',
+      roomId,
+      event, // muted | unmuted | role
+      userId: member.userId,
+      role: member.role,
+      mutedUntil: member.mutedUntil,
+      version: member.permVersion,
+      rev,
+      ts: member.permUpdatedAt,
+      by: actorId,
+      ...extra,
+    });
   }
 
   const handlers = {
@@ -112,6 +163,7 @@ function createChatServer(overrides = {}) {
         name: room.name,
         role: 'admin',
         mutedUntil: 0,
+        permVersion: 0,
         lastSeq: 0,
       });
     },
@@ -128,7 +180,8 @@ function createChatServer(overrides = {}) {
         roomId: room.id,
         name: room.name,
         role: member.role,
-        mutedUntil: member.muted_until,
+        mutedUntil: member.mutedUntil,
+        permVersion: member.permVersion,
         lastSeq: room.last_seq,
       });
       // 补发：优先用客户端上报的进度，否则用服务端游标（新设备则从游标开始）
@@ -148,8 +201,11 @@ function createChatServer(overrides = {}) {
         fail('BAD_REQUEST', `content must be 1..${config.maxContentLength} chars`);
       }
       const member = requireMember(conn, msg.roomId);
-      if (member.muted_until > now()) {
-        fail('MUTED', `you are muted until ${new Date(member.muted_until).toISOString()}`);
+      if (member.mutedUntil > now()) {
+        fail('MUTED', `you are muted until ${new Date(member.mutedUntil).toISOString()}`, {
+          mutedUntil: member.mutedUntil,
+          version: member.permVersion,
+        });
       }
       if (!limiter.take(conn.userId)) fail('RATE_LIMITED', 'sending too fast, slow down');
 
@@ -210,38 +266,54 @@ function createChatServer(overrides = {}) {
     },
 
     mute(conn, msg) {
-      requireAdmin(conn, msg.roomId);
-      const target = db.getMember(msg.roomId, msg.userId);
-      if (!target) fail('NOT_MEMBER', 'target is not a member');
-      if (target.role === 'admin') fail('FORBIDDEN', 'cannot mute an admin');
+      if (!isNonEmptyString(msg.roomId, 128) || !isNonEmptyString(msg.userId, 64)) {
+        fail('BAD_REQUEST', 'invalid roomId or userId');
+      }
       const minutes = Number(msg.minutes);
       if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
         fail('BAD_REQUEST', 'minutes must be 1..1440');
       }
       const until = now() + Math.round(minutes * 60_000);
-      db.setMuted(msg.roomId, msg.userId, until);
-      hub.broadcast(msg.roomId, {
-        type: 'notice',
-        roomId: msg.roomId,
-        event: 'muted',
-        userId: msg.userId,
-        until,
-        by: conn.userId,
+      // 版本号可选携带：管理员基于自己看到的成员视图操作，过期视图直接判定冲突
+      const expectedVersion = Number.isInteger(msg.version) ? msg.version : null;
+      const { member, rev, changed } = applyPerm(conn, msg.roomId, {
+        action: 'mute',
+        targetId: msg.userId,
+        mutedUntil: until,
+        expectedVersion,
       });
+      if (changed) broadcastPermNotice(msg.roomId, 'muted', member, rev, conn.userId, { until: member.mutedUntil });
     },
 
     unmute(conn, msg) {
-      requireAdmin(conn, msg.roomId);
-      const target = db.getMember(msg.roomId, msg.userId);
-      if (!target) fail('NOT_MEMBER', 'target is not a member');
-      db.setMuted(msg.roomId, msg.userId, 0);
-      hub.broadcast(msg.roomId, {
-        type: 'notice',
-        roomId: msg.roomId,
-        event: 'unmuted',
-        userId: msg.userId,
-        by: conn.userId,
+      if (!isNonEmptyString(msg.roomId, 128) || !isNonEmptyString(msg.userId, 64)) {
+        fail('BAD_REQUEST', 'invalid roomId or userId');
+      }
+      const expectedVersion = Number.isInteger(msg.version) ? msg.version : null;
+      const { member, rev, changed } = applyPerm(conn, msg.roomId, {
+        action: 'unmute',
+        targetId: msg.userId,
+        expectedVersion,
       });
+      if (changed) broadcastPermNotice(msg.roomId, 'unmuted', member, rev, conn.userId);
+    },
+
+    // 角色升降（admin/member）：同样走版本化权限变更
+    set_role(conn, msg) {
+      if (!isNonEmptyString(msg.roomId, 128) || !isNonEmptyString(msg.userId, 64)) {
+        fail('BAD_REQUEST', 'invalid roomId or userId');
+      }
+      if (msg.role !== 'admin' && msg.role !== 'member') {
+        fail('BAD_REQUEST', 'role must be admin or member');
+      }
+      const expectedVersion = Number.isInteger(msg.version) ? msg.version : null;
+      const { member, rev, changed } = applyPerm(conn, msg.roomId, {
+        action: 'role',
+        targetId: msg.userId,
+        role: msg.role,
+        expectedVersion,
+      });
+      if (changed) broadcastPermNotice(msg.roomId, 'role', member, rev, conn.userId, { role: member.role });
     },
   };
 
@@ -264,6 +336,7 @@ function createChatServer(overrides = {}) {
           type: 'error',
           code: err.code,
           message: err.message,
+          ...(err.details ? { details: err.details } : {}),
           ref: msg.clientMsgId || msg.roomId || undefined,
         });
       } else {
