@@ -96,6 +96,53 @@ function createChatServer(overrides = {}) {
     return member;
   }
 
+  /**
+   * 禁言/解禁的唯一写路径：读当前行（含版本号）→ CAS 条件提交 → 用「提交后」的
+   * DB 行与审计行下发同一条通知。
+   *
+   * 关键一致性保证：
+   *  - CAS（WHERE perms_version = 读到的版本）让并发管理员中每轮只有一人提交成功，
+   *    失败者重读最新版本重试；最终落库的操作即审计表里最后一条事件。
+   *  - 通知的 until / version / ts / by 全部取自提交成功后的权威结果，而非入参或
+   *    提交前的快照——因此「DB 状态、发消息时 getMember 的权限判断、客户端收到的
+   *    通知」永远是同一份结果，不会出现通知解禁了但服务端仍拒发的割裂。
+   *  - version 随每次成功变更严格 +1，rev 为权限事件全局序号；客户端按 version
+   *    单调应用，乱序到达的旧通知无法把新状态回退。
+   */
+  function applyPermChange(conn, { roomId, userId, event, mutedUntil }) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const target = db.getMember(roomId, userId);
+      if (!target) fail('NOT_MEMBER', 'target is not a member');
+      if (event === 'muted' && target.role === 'admin') {
+        fail('FORBIDDEN', 'cannot mute an admin');
+      }
+      const result = db.changeMemberPerms({
+        roomId,
+        userId,
+        event,
+        mutedUntil,
+        expectedVersion: target.permsVersion,
+        byUserId: conn.userId,
+      });
+      if (!result.applied) continue; // 被其他管理员抢先提交：重读最新版本再试
+
+      const { member, event: ev } = result;
+      hub.broadcast(roomId, {
+        type: 'notice',
+        roomId,
+        event: ev.event,
+        userId,
+        until: member.mutedUntil, // 解禁时为 0
+        by: ev.by_user_id,
+        ts: ev.ts,
+        version: member.permsVersion, // 成员权限版本，客户端按序应用
+        rev: ev.id, // 房间权限事件全局序号，可追溯
+      });
+      return;
+    }
+    fail('CONFLICT', 'permission changed concurrently, please retry');
+  }
+
   const handlers = {
     ping(conn, msg) {
       hub.send(conn, { type: 'pong', t: msg.t });
@@ -112,6 +159,7 @@ function createChatServer(overrides = {}) {
         name: room.name,
         role: 'admin',
         mutedUntil: 0,
+        permsVersion: 0,
         lastSeq: 0,
       });
     },
@@ -123,12 +171,14 @@ function createChatServer(overrides = {}) {
       db.joinRoom(room.id, conn.userId);
       hub.joinRoom(conn, room.id);
       const member = db.getMember(room.id, conn.userId);
+      // joined 是权限快照：带版本号，客户端据此做乐观锁与乱序通知判定
       hub.send(conn, {
         type: 'joined',
         roomId: room.id,
         name: room.name,
         role: member.role,
-        mutedUntil: member.muted_until,
+        mutedUntil: member.mutedUntil,
+        permsVersion: member.permsVersion,
         lastSeq: room.last_seq,
       });
       // 补发：优先用客户端上报的进度，否则用服务端游标（新设备则从游标开始）
@@ -148,8 +198,9 @@ function createChatServer(overrides = {}) {
         fail('BAD_REQUEST', `content must be 1..${config.maxContentLength} chars`);
       }
       const member = requireMember(conn, msg.roomId);
-      if (member.muted_until > now()) {
-        fail('MUTED', `you are muted until ${new Date(member.muted_until).toISOString()}`);
+      // 发消息权限判断只以 DB 权威行为准（与下发通知同一来源、同一版本）
+      if (member.mutedUntil > now()) {
+        fail('MUTED', `you are muted until ${new Date(member.mutedUntil).toISOString()}`);
       }
       if (!limiter.take(conn.userId)) fail('RATE_LIMITED', 'sending too fast, slow down');
 
@@ -219,14 +270,11 @@ function createChatServer(overrides = {}) {
         fail('BAD_REQUEST', 'minutes must be 1..1440');
       }
       const until = now() + Math.round(minutes * 60_000);
-      db.setMuted(msg.roomId, msg.userId, until);
-      hub.broadcast(msg.roomId, {
-        type: 'notice',
+      applyPermChange(conn, {
         roomId: msg.roomId,
-        event: 'muted',
         userId: msg.userId,
-        until,
-        by: conn.userId,
+        event: 'muted',
+        mutedUntil: until,
       });
     },
 
@@ -234,13 +282,11 @@ function createChatServer(overrides = {}) {
       requireAdmin(conn, msg.roomId);
       const target = db.getMember(msg.roomId, msg.userId);
       if (!target) fail('NOT_MEMBER', 'target is not a member');
-      db.setMuted(msg.roomId, msg.userId, 0);
-      hub.broadcast(msg.roomId, {
-        type: 'notice',
+      applyPermChange(conn, {
         roomId: msg.roomId,
-        event: 'unmuted',
         userId: msg.userId,
-        by: conn.userId,
+        event: 'unmuted',
+        mutedUntil: 0,
       });
     },
   };

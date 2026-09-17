@@ -7,6 +7,8 @@ const os = require('node:os');
 const path = require('node:path');
 const WebSocket = require('ws');
 const { createChatServer } = require('../src/server');
+const { ChatDB } = require('../src/db');
+const { now } = require('../src/util');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -444,5 +446,194 @@ test('持久化：服务重启后消息不丢失', async () => {
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------- 权限并发一致性
+
+/** 直接把某成员提升为管理员（协议暂无角色变更，测试用 DB 造第二个管理员） */
+function makeAdmin(server, roomId, userId) {
+  server.db.db
+    .prepare('UPDATE members SET role = ? WHERE room_id = ? AND user_id = ?')
+    .run('admin', roomId, userId);
+}
+
+/** 等到 client 日志里出现指定数量的 notice 权限事件 */
+async function waitNotices(client, roomId, count, timeout = 3000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const got = client.log.filter((m) => m.type === 'notice' && m.roomId === roomId);
+    if (got.length >= count) return got;
+    await sleep(20);
+  }
+  throw new Error(`expected ${count} notices, got ${client.log.filter((m) => m.type === 'notice').length}`);
+}
+
+test('DB 层：权限 CAS——旧版本号写入被拒，版本严格递增，审计事件全序可追溯', () => {
+  const db = new ChatDB(':memory:');
+  try {
+    const admin = db.createUser('u_admin', 'admin', 's1');
+    const target = db.createUser('u_target', 'target', 's2');
+    const room = db.createRoom('r_1', 'room', admin.id);
+    db.joinRoom(room.id, target.id);
+
+    const until1 = now() + 60_000;
+    const ok1 = db.changeMemberPerms({
+      roomId: room.id, userId: target.id, event: 'muted', mutedUntil: until1,
+      expectedVersion: 0, byUserId: admin.id,
+    });
+    assert.equal(ok1.applied, true);
+    assert.equal(ok1.member.permsVersion, 1);
+    assert.equal(ok1.member.mutedUntil, until1);
+
+    // 另一管理员拿着过期版本号 0 来解禁 —— 必须被拒，状态不被覆盖
+    const stale = db.changeMemberPerms({
+      roomId: room.id, userId: target.id, event: 'unmuted', mutedUntil: 0,
+      expectedVersion: 0, byUserId: admin.id,
+    });
+    assert.equal(stale.applied, false);
+    assert.equal(db.getMember(room.id, target.id).mutedUntil, until1, '过期写入不得改变状态');
+    assert.equal(db.getMember(room.id, target.id).permsVersion, 1);
+
+    // 拿着最新版本号 1 解禁 —— 成功，版本到 2
+    const ok2 = db.changeMemberPerms({
+      roomId: room.id, userId: target.id, event: 'unmuted', mutedUntil: 0,
+      expectedVersion: 1, byUserId: admin.id,
+    });
+    assert.equal(ok2.applied, true);
+    assert.equal(ok2.member.permsVersion, 2);
+    assert.equal(ok2.member.mutedUntil, 0);
+
+    // 审计表：按 id 全序，version/event/until 与实际落库一致（可追溯）
+    const events = db.listPermEvents(room.id);
+    assert.deepEqual(events.map((e) => e.event), ['muted', 'unmuted']);
+    assert.deepEqual(events.map((e) => e.version), [1, 2]);
+    assert.deepEqual(events.map((e) => e.muted_until), [until1, 0]);
+    assert.ok(events[1].id > events[0].id, '审计 id 严格递增');
+    assert.ok(events.every((e) => e.ts > 0 && e.by_user_id === admin.id));
+  } finally {
+    db.close();
+  }
+});
+
+test('多管理员连续操作同一成员：通知版本/序号严格有序，终态=最后通知=发消息权限', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const uc = await login(port, 'carol');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const c = await Client.connect(port, uc.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await joinRoom(c, roomId);
+    makeAdmin(server, roomId, ub.userId); // 第二个管理员
+
+    // 两管理员交错快速操作：禁言10分 → 解禁 → 禁言5分
+    a.send({ type: 'mute', roomId, userId: uc.userId, minutes: 10 });
+    b.send({ type: 'unmute', roomId, userId: uc.userId });
+    a.send({ type: 'mute', roomId, userId: uc.userId, minutes: 5 });
+
+    const notices = await waitNotices(c, roomId, 3);
+
+    // 三次操作各自落库：版本号连续 1,2,3（应用顺序），全局序号严格递增、无回退
+    assert.deepEqual(notices.map((n) => n.version), [1, 2, 3]);
+    assert.deepEqual(new Set(notices.map((n) => n.event)), new Set(['muted', 'unmuted']));
+    assert.ok(
+      notices[1].rev > notices[0].rev && notices[2].rev > notices[1].rev,
+      'rev 严格递增，通知顺序可追溯'
+    );
+    assert.ok(notices.every((n) => typeof n.ts === 'number' && n.by));
+    // 每条通知的 until 都与其时的 DB 行一致（通知不脱离 DB 状态）
+    for (const n of notices) {
+      const m = server.db.listPermEvents(roomId).find((e) => e.id === n.rev);
+      assert.equal(m.muted_until, n.until);
+      assert.equal(m.version, n.version);
+    }
+
+    // 终态再下一次决定性禁言，避免依赖跨 socket 突发的到达顺序
+    a.send({ type: 'mute', roomId, userId: uc.userId, minutes: 8 });
+    const finalNotice = await c.waitFor(
+      (m) => m.type === 'notice' && m.roomId === roomId && m.version === 4
+    );
+
+    // 三同源：最后一条通知的 until/version === 数据库终态
+    const dbMember = server.db.getMember(roomId, uc.userId);
+    assert.equal(dbMember.permsVersion, 4);
+    assert.equal(dbMember.mutedUntil, finalNotice.until);
+
+    // 发消息时的权限判断采用同一份 DB 状态：终态禁言中 -> 被拒
+    c.send({ type: 'msg', roomId, clientMsgId: 'm-blocked', content: 'should fail' });
+    const err = await c.waitFor((m) => m.type === 'error' && m.code === 'MUTED');
+    assert.ok(err);
+
+    await Promise.all([a.close(), b.close(), c.close()]);
+  } finally {
+    server.stop();
+  }
+});
+
+test('解禁为最终操作时：最后通知、DB 终态与发送放行一致（不出现显示解禁仍拒发）', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const uc = await login(port, 'carol');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const c = await Client.connect(port, uc.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await joinRoom(c, roomId);
+    makeAdmin(server, roomId, ub.userId);
+
+    a.send({ type: 'mute', roomId, userId: uc.userId, minutes: 10 });
+    await waitNotices(c, roomId, 1); // 等禁言落库后，再由第二管理员解禁，固定操作顺序
+    b.send({ type: 'unmute', roomId, userId: uc.userId }); // 解禁为最终操作
+    const notices = await waitNotices(c, roomId, 2);
+    assert.equal(notices[1].event, 'unmuted');
+    assert.equal(notices[1].until, 0);
+
+    const dbMember = server.db.getMember(roomId, uc.userId);
+    assert.equal(dbMember.mutedUntil, 0, 'DB 已解禁');
+    assert.equal(dbMember.permsVersion, notices[1].version);
+
+    // 服务端权限判断与通知同源：解禁后可正常发送
+    c.send({ type: 'msg', roomId, clientMsgId: 'm-free', content: 'i am free' });
+    const ack = await c.waitFor((m) => m.type === 'ack' && m.clientMsgId === 'm-free');
+    assert.equal(ack.seq, 1);
+
+    await Promise.all([a.close(), b.close(), c.close()]);
+  } finally {
+    server.stop();
+  }
+});
+
+test('禁言已过期：DB 截止时间在过去不再阻止发送', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const uc = await login(port, 'carol');
+    const a = await Client.connect(port, ua.token);
+    const c = await Client.connect(port, uc.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(c, roomId);
+
+    a.send({ type: 'mute', roomId, userId: uc.userId, minutes: 10 });
+    await waitNotices(c, roomId, 1);
+    // 模拟禁言到期（直接把截止时间改到过去）
+    server.db.db
+      .prepare('UPDATE members SET muted_until = ? WHERE room_id = ? AND user_id = ?')
+      .run(now() - 1, roomId, uc.userId);
+
+    c.send({ type: 'msg', roomId, clientMsgId: 'm-expired', content: 'mute expired' });
+    const ack = await c.waitFor((m) => m.type === 'ack' && m.clientMsgId === 'm-expired');
+    assert.equal(ack.seq, 1, '过期禁言不得继续阻止消息');
+
+    await a.close();
+    await c.close();
+  } finally {
+    server.stop();
   }
 });

@@ -85,7 +85,7 @@
  */
 const $ = (id) => document.getElementById(id);
 let ws = null, me = null, currentRoom = null;
-const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], pending:Map}
+const rooms = new Map(); // roomId -> {name, role, mutedUntil, permsVersion, lastSeenSeq, msgs:[], pending:Map}
 let reconnectDelay = 500, ackTimer = null, retryTimer = null;
 
 const store = {
@@ -139,6 +139,8 @@ function handle(m) {
       const saved = store.load();
       const r = rooms.get(m.roomId) || { msgs: [], pending: new Map(), lastSeenSeq: 0 };
       r.name = m.name; r.role = m.role; r.mutedUntil = m.mutedUntil;
+      // joined 是带版本号的权限快照；重连时取较大版本，避免本地残留版本号让新通知被误判为旧
+      r.permsVersion = Math.max(r.permsVersion || 0, m.permsVersion || 0);
       r.lastSeenSeq = Math.max(r.lastSeenSeq, saved[m.roomId]?.lastSeenSeq || 0);
       rooms.set(m.roomId, r);
       if (!currentRoom) currentRoom = m.roomId;
@@ -176,9 +178,16 @@ function handle(m) {
       break;
     case 'notice': {
       const r = rooms.get(m.roomId);
+      // 权限通知按版本号单调应用：乱序到达或重连后已被 joined 快照覆盖的旧通知
+      // （version 更小）一律丢弃，防止「后到的旧解禁」把「新禁言」状态回退。
+      if (r && typeof m.version === 'number') {
+        if (m.version <= (r.permsVersion || 0)) break;
+        r.permsVersion = m.version;
+      }
       if (r && m.userId === me.userId) r.mutedUntil = m.event === 'muted' ? m.until : 0;
       sys(m.roomId, m.event === 'muted' ? `有成员被禁言至 ${new Date(m.until).toLocaleTimeString()}` : '有成员被解除禁言');
       refreshMembers();
+      if (m.userId === me.userId) render();
       break;
     }
     case 'members':
@@ -201,6 +210,15 @@ function scheduleAck() {
 
 function refreshMembers() { if (currentRoom) send({ type: 'members', roomId: currentRoom }); }
 setInterval(refreshMembers, 5000);
+
+// 禁言到期自动解除输入锁定：mutedUntil 一过点，重渲染即解禁，无需等待新通知
+setInterval(() => {
+  const r = rooms.get(currentRoom);
+  if (r && r.mutedUntil && r.mutedUntil <= Date.now()) {
+    r.mutedUntil = 0;
+    render();
+  }
+}, 1000);
 
 // 未 ACK 的消息每秒重发一次（clientMsgId 不变，服务端幂等）
 retryTimer = setInterval(() => {

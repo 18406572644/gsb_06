@@ -12,6 +12,10 @@ const { now } = require('./util');
  *    提交同一条消息时不会产生重复记录，实现发送幂等。
  * 3. seq 为每房间单调递增序号，由 rooms.last_seq 计数器在事务内分配——保证房间内
  *    消息全序（时序可控），客户端可凭 seq 检测空洞并触发补发。
+ * 4. 成员权限（角色/禁言）带 perms_version 乐观锁版本号：禁言/解禁等变更必须携带
+ *    「读到的版本号」做条件更新（CAS），并在同一事务内写一条 member_perm_events
+ *    审计事件。于是「数据库终态、发消息时的权限判断、下发的通知」三者同源，多个
+ *    管理员并发操作时只有最新版本会落库，通知按审计表自增 id 严格全序、可追溯。
  */
 
 const SCHEMA = `
@@ -36,13 +40,30 @@ CREATE TABLE IF NOT EXISTS rooms (
 );
 
 CREATE TABLE IF NOT EXISTS members (
-  room_id     TEXT NOT NULL REFERENCES rooms(id),
-  user_id     TEXT NOT NULL REFERENCES users(id),
-  role        TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('admin','member')),
-  muted_until INTEGER NOT NULL DEFAULT 0,
-  joined_at   INTEGER NOT NULL,
+  room_id          TEXT NOT NULL REFERENCES rooms(id),
+  user_id          TEXT NOT NULL REFERENCES users(id),
+  role             TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('admin','member')),
+  muted_until      INTEGER NOT NULL DEFAULT 0,
+  joined_at        INTEGER NOT NULL,
+  perms_version    INTEGER NOT NULL DEFAULT 0,   -- 权限乐观锁版本号，每次变更 +1
+  perms_updated_at INTEGER NOT NULL DEFAULT 0,   -- 最近一次权限变更时间（ms）
+  perms_by         TEXT,                          -- 最近一次变更操作者 user_id
   PRIMARY KEY (room_id, user_id)
 );
+
+-- 成员权限变更审计：每个管理员动作在「更新成员」的同一事务内追加一行。
+-- 自增 id 即权限事件的全局严格顺序，通知按此顺序下发，断线/排障可追溯。
+CREATE TABLE IF NOT EXISTS member_perm_events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id     TEXT NOT NULL REFERENCES rooms(id),
+  user_id     TEXT NOT NULL REFERENCES users(id),
+  event       TEXT NOT NULL CHECK (event IN ('muted','unmuted')),
+  muted_until INTEGER NOT NULL,                   -- 变更后的 muted_until（解禁为 0）
+  version     INTEGER NOT NULL,                   -- 变更后该成员的 perms_version
+  by_user_id  TEXT NOT NULL REFERENCES users(id),
+  ts          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_perm_events_room ON member_perm_events (room_id, id);
 
 CREATE TABLE IF NOT EXISTS messages (
   room_id       TEXT NOT NULL REFERENCES rooms(id),
@@ -75,7 +96,17 @@ class ChatDB {
   constructor(dbPath) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(SCHEMA);
+    this._migrate();
     this._prepare();
+  }
+
+  /** 旧库（无权限版本列）补列；新建库因 SCHEMA 已含列而跳过 */
+  _migrate() {
+    const cols = new Set(this.db.prepare('PRAGMA table_info(members)').all().map((c) => c.name));
+    const alter = (ddl) => { try { this.db.exec(ddl); } catch { /* 列已存在 */ } };
+    if (!cols.has('perms_version')) alter('ALTER TABLE members ADD COLUMN perms_version INTEGER NOT NULL DEFAULT 0');
+    if (!cols.has('perms_updated_at')) alter('ALTER TABLE members ADD COLUMN perms_updated_at INTEGER NOT NULL DEFAULT 0');
+    if (!cols.has('perms_by')) alter('ALTER TABLE members ADD COLUMN perms_by TEXT');
   }
 
   _prepare() {
@@ -89,7 +120,8 @@ class ChatDB {
       roomById: d.prepare('SELECT * FROM rooms WHERE id = ?'),
       roomByName: d.prepare('SELECT * FROM rooms WHERE name = ?'),
       roomsForUser: d.prepare(
-        `SELECT r.id, r.name, r.last_seq AS lastSeq, m.role, m.muted_until AS mutedUntil
+        `SELECT r.id, r.name, r.last_seq AS lastSeq, m.role, m.muted_until AS mutedUntil,
+                m.perms_version AS permsVersion
            FROM rooms r JOIN members m ON m.room_id = r.id
           WHERE m.user_id = ? ORDER BY r.created_at`
       ),
@@ -99,10 +131,28 @@ class ChatDB {
          VALUES (?, ?, ?, 0, ?)
          ON CONFLICT (room_id, user_id) DO NOTHING`
       ),
-      member: d.prepare('SELECT * FROM members WHERE room_id = ? AND user_id = ?'),
-      setMuted: d.prepare('UPDATE members SET muted_until = ? WHERE room_id = ? AND user_id = ?'),
+      member: d.prepare(
+        `SELECT room_id AS roomId, user_id AS userId, role, muted_until AS mutedUntil,
+                joined_at AS joinedAt, perms_version AS permsVersion,
+                perms_updated_at AS permsUpdatedAt, perms_by AS permsBy
+           FROM members WHERE room_id = ? AND user_id = ?`
+      ),
+      // CAS 条件更新：仅当版本号仍是调用方读到的 expectedVersion 时才生效
+      casMuted: d.prepare(
+        `UPDATE members
+            SET muted_until = ?, perms_version = perms_version + 1,
+                perms_updated_at = ?, perms_by = ?
+          WHERE room_id = ? AND user_id = ? AND perms_version = ?`
+      ),
+      insertPermEvent: d.prepare(
+        `INSERT INTO member_perm_events (room_id, user_id, event, muted_until, version, by_user_id, ts)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ),
+      permEventById: d.prepare('SELECT * FROM member_perm_events WHERE id = ?'),
       membersOfRoom: d.prepare(
-        `SELECT m.user_id AS userId, u.name, m.role, m.muted_until AS mutedUntil
+        `SELECT m.user_id AS userId, u.name, m.role, m.muted_until AS mutedUntil,
+                m.perms_version AS permsVersion, m.perms_updated_at AS permsUpdatedAt,
+                m.perms_by AS permsBy
            FROM members m JOIN users u ON u.id = m.user_id WHERE m.room_id = ?`
       ),
 
@@ -177,10 +227,45 @@ class ChatDB {
 
   getMember(roomId, userId) { return this.stmt.member.get(roomId, userId); }
 
-  /** 设置禁言截止时间（0 表示解除禁言） */
-  setMuted(roomId, userId, mutedUntil) {
-    this.stmt.setMuted.run(mutedUntil, roomId, userId);
-    return this.stmt.member.get(roomId, userId);
+  /**
+   * 禁言/解禁：带乐观锁版本号的条件更新（CAS）。
+   *
+   * 在同一个 IMMEDIATE 事务内：
+   *  1) 仅当成员当前 perms_version === expectedVersion 时才更新 muted_until 并令版本 +1；
+   *  2) 更新成功则追加一条 member_perm_events 审计行（自增 id 即通知顺序）。
+   *
+   * 返回 { applied:true, member, event }：member 为提交后重读的权威行，event 含
+   * 审计 id，调用方据此（而非入参）下发通知，保证 DB 状态 / 权限判断 / 通知三同源。
+   * 版本已过期（其他管理员抢先提交）时返回 { applied:false, member }，由调用方重读重试。
+   */
+  changeMemberPerms({ roomId, userId, event, mutedUntil, expectedVersion, byUserId }) {
+    return this._tx(() => {
+      const ts = now();
+      const res = this.stmt.casMuted.run(
+        mutedUntil, ts, byUserId, roomId, userId, expectedVersion
+      );
+      if (res.changes === 0) {
+        // 版本不匹配或成员不存在：返回当前行供调用方判断（不存在则 member 为 null）
+        return { applied: false, member: this.stmt.member.get(roomId, userId) };
+      }
+      const info = this.stmt.insertPermEvent.run(
+        roomId, userId, event, mutedUntil, expectedVersion + 1, byUserId, ts
+      );
+      return {
+        applied: true,
+        member: this.stmt.member.get(roomId, userId),
+        event: this.stmt.permEventById.get(Number(info.lastInsertRowid)),
+      };
+    });
+  }
+
+  /** 权限事件审计（按发生顺序升序），用于排查/补发后的追溯 */
+  listPermEvents(roomId, { afterId = 0, limit = 200 } = {}) {
+    return this.db
+      .prepare(
+        `SELECT * FROM member_perm_events WHERE room_id = ? AND id > ? ORDER BY id LIMIT ?`
+      )
+      .all(roomId, afterId, Math.min(Math.max(1, limit), 1000));
   }
 
   // ---------- 消息 ----------
